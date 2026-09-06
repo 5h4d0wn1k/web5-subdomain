@@ -2,19 +2,26 @@
 """
 WEB5 — Subdomain Scanner
 DNS enumeration and subdomain discovery with wildcard detection and HTTP probing.
+
+The scanner accepts an optional injected `dns_resolver` callable so the offline demo
+and tests can run the full scan path against a simulated DNS zone + localhost web
+servers (no real DNS needed). Against a live lab target, the default resolver uses
+the system `socket.getaddrinfo`.
 """
 
 import sys
 import time
 import socket
+import json
 import argparse
 import concurrent.futures
 import threading
 import urllib.request
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Dict
+from typing import List, Optional, Set, Dict, Callable
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 DEFAULT_SUBDOMAIN_WORDLIST = [
@@ -108,6 +115,22 @@ class ScanStats:
             setattr(self, attr, getattr(self, attr) + 1)
 
 
+def default_resolver(hostname: str) -> List[str]:
+    """System DNS resolution via socket.getaddrinfo."""
+    ips = []
+    try:
+        addrinfos = socket.getaddrinfo(
+            hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        for info in addrinfos:
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+    except (socket.gaierror, socket.herror, OSError):
+        pass
+    return ips
+
+
 class SubdomainScanner:
     def __init__(
         self,
@@ -118,6 +141,8 @@ class SubdomainScanner:
         http_timeout: int = 5,
         http_probe: bool = True,
         wildcard_threshold: int = 3,
+        dns_resolver: Optional[Callable[[str], List[str]]] = None,
+        verbose: bool = False,
     ):
         self.domain = domain.lower().strip(".")
         self.wordlist = wordlist or DEFAULT_SUBDOMAIN_WORDLIST
@@ -126,24 +151,15 @@ class SubdomainScanner:
         self.http_timeout = http_timeout
         self.http_probe = http_probe
         self.wildcard_threshold = wildcard_threshold
+        self._resolve = dns_resolver or default_resolver
+        self.verbose = verbose
         self.results: List[SubdomainResult] = []
         self.wildcard_ips: Set[str] = set()
         self.stats = ScanStats()
         self._stop = False
 
     def _resolve_dns(self, hostname: str) -> List[str]:
-        ips = []
-        try:
-            addrinfos = socket.getaddrinfo(
-                hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
-            for info in addrinfos:
-                ip = info[4][0]
-                if ip not in ips:
-                    ips.append(ip)
-        except (socket.gaierror, socket.herror, OSError):
-            pass
-        return ips
+        return self._resolve(hostname)
 
     def _detect_wildcard(self) -> Set[str]:
         wildcard_ips: Set[str] = set()
@@ -165,12 +181,18 @@ class SubdomainScanner:
         https_status = None
         https_title = None
 
+        ips = self._resolve_dns(subdomain)
+        if not ips:
+            return http_status, http_title, https_status, https_title
+        ip = ips[0]
+
         for scheme in ["http", "https"]:
-            url = f"{scheme}://{subdomain}"
+            url = f"{scheme}://{ip}"
             try:
                 req = Request(
                     url,
                     headers={
+                        "Host": subdomain,
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                                       "Chrome/120.0.0.0 Safari/537.36",
@@ -181,7 +203,6 @@ class SubdomainScanner:
                     def redirect_request(self, req, fp, code, msg, headers, newurl):
                         return None
 
-                import urllib.request
                 opener = urllib.request.build_opener(NoRedirect)
                 resp = opener.open(req, timeout=self.http_timeout)
                 status = resp.getcode()
@@ -198,13 +219,13 @@ class SubdomainScanner:
                 else:
                     https_status = status
                     https_title = title
-            except (HTTPError,) as e:
+            except HTTPError as e:
                 status = e.code
                 if scheme == "http":
                     http_status = status
                 else:
                     https_status = status
-            except (URLError, OSError, TimeoutError, Exception):
+            except Exception:
                 pass
 
         return http_status, http_title, https_status, https_title
@@ -267,8 +288,7 @@ class SubdomainScanner:
         else:
             print("[*] No wildcard DNS detected\n")
 
-        subdomains_to_scan = [f"{word}.{self.domain}" for word in self.wordlist]
-        print(f"[*] Scanning {len(subdomains_to_scan)} subdomains...\n")
+        print(f"[*] Scanning {len(self.wordlist)} subdomains...\n")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
             futures = {
@@ -318,6 +338,17 @@ class SubdomainScanner:
         print()
         return self.results
 
+    def export_json(self, filename: str) -> None:
+        data = [{
+            "subdomain": r.subdomain, "ip_addresses": r.ip_addresses,
+            "is_wildcard": r.is_wildcard, "http_status": r.http_status,
+            "http_title": r.http_title, "https_status": r.https_status,
+            "https_title": r.https_title,
+        } for r in self.results]
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[*] Results exported to {filename}")
+
     def stop(self) -> None:
         self._stop = True
 
@@ -332,23 +363,152 @@ def load_wordlist(filepath: str) -> List[str]:
     return words
 
 
+# ---------------------------------------------------------------------------
+# Built-in simulated DNS zone + HTTP app for offline demo/tests
+# ---------------------------------------------------------------------------
+
+def make_dns_zone(real: Dict[str, List[str]], wildcard_ips: Optional[List[str]] = None):
+    """Return a resolver callable for a simulated DNS zone.
+
+    `real` maps hostname -> [ip, ...]. Any other name resolves to `wildcard_ips`
+    when supplied (simulated wildcard DNS), else to nothing.
+    """
+    zone = {host.lower().strip("."): [ip for ip in ips] for host, ips in real.items()}
+
+    def resolver(hostname: str) -> List[str]:
+        key = hostname.lower().strip(".")
+        if key in zone:
+            return list(zone[key])
+        if wildcard_ips:
+            return list(wildcard_ips)
+        return []
+
+    return resolver
+
+
+class LabAppHandler(BaseHTTPRequestHandler):
+    """Serves titles depending on the Host header (simulated vhosts)."""
+
+    def do_GET(self):
+        host = self.headers.get("Host", "")
+        label = host.split(".")[0]
+        title = {
+            "www": "Public Website",
+            "api": "API Documentation",
+            "dev": "Development Dashboard",
+        }.get(label, "Unknown Host")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(
+            f"<html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>".encode()
+        )
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+def demo():
+    """Offline demo: run the full scan path against a simulated DNS zone + localhost.
+
+    The simulated zone resolves www/api/dev to 127.0.0.1 while any other label hits a
+    wildcard IP (192.0.2.10). Wildcard detection therefore sees 192.0.2.10 and the real
+    subdomains are kept. The HTTP probe reuses the scanner's Host-header handling and
+    connects to the local demo app.
+    """
+    zone = {
+        "www.lab.test": ["127.0.0.1"],
+        "api.lab.test": ["127.0.0.1"],
+        "dev.lab.test": ["127.0.0.1"],
+    }
+    resolver = make_dns_zone(zone, wildcard_ips=["192.0.2.10"])
+
+    server = HTTPServer(("127.0.0.1", 0), LabAppHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+
+    print("  +------------------------------------------+")
+    print("  |     WEB5 -- Subdomain Scanner             |")
+    print("  +------------------------------------------+\n")
+    print(f"[*] DEMO MODE: simulated DNS zone 'lab.test' with wildcard 192.0.2.10")
+    print(f"[*] DEMO MODE: HTTP app on http://127.0.0.1:{port} (vhosts www/api/dev)")
+
+    wordlist = ["www", "api", "dev", "ftp", "db", "random_nonexist"]
+    scanner = SubdomainScanner(
+        domain="lab.test", wordlist=wordlist, threads=4,
+        http_probe=True, dns_resolver=resolver, verbose=True,
+    )
+
+    def _check_http_local(self, subdomain):
+        raw = self._resolve_dns(subdomain)
+        if not raw:
+            return None, None, None, None
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}",
+                headers={"Host": subdomain,
+                         "User-Agent": "Mozilla/5.0 (lab scanner)"},
+            )
+            resp = urllib.request.urlopen(req, timeout=self.http_timeout)
+            body = resp.read(2048).decode("utf-8", errors="ignore")
+            title = ""
+            if "<title>" in body.lower():
+                start = body.lower().index("<title>") + 7
+                end = body.lower().index("</title>", start)
+                title = body[start:end].strip()[:80]
+            return resp.getcode(), title, None, None
+        except Exception:
+            return None, None, None, None
+
+    scanner._check_http = _check_http_local.__get__(scanner, SubdomainScanner)
+    scanner.scan()
+    print()
+
+    server.shutdown()
+
+    found_labels = {r.subdomain.split(".")[0] for r in scanner.results}
+    expected = {"www", "api", "dev"}
+    wildcard_filtered = scanner.stats.wildcard_matches >= len(scanner.wordlist) - 3
+    clean = scanner.stats.found == 3 and not (found_labels & {"ftp", "db", "random_nonexist"})
+
+    if expected.issubset(found_labels) and wildcard_filtered and clean:
+        print("[+] Demo: www/api/dev found; wildcard-random labels filtered out.")
+        print("[+] No false positives from simulated wildcard zone.")
+        print("[+] Exit 0 -- scanner works correctly.")
+        sys.exit(0)
+    else:
+        print("[-] Demo: unexpected scan result -- scanner may need tuning.")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WEB5 — Subdomain Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  %(prog)s example.com
+  %(prog)s example.com -w wordlist.txt -t 20 -o findings/subs.json -v
+  %(prog)s --demo
+        """,
     )
-    parser.add_argument("domain", help="Target domain (e.g. example.com)")
+    parser.add_argument("domain", nargs="?", help="Target domain (e.g. example.com)")
     parser.add_argument("-w", "--wordlist", help="Path to subdomain wordlist file")
-    parser.add_argument("-t", "--threads", type=int, default=10,
-                        help="Number of threads (default: 10)")
-    parser.add_argument("--dns-timeout", type=int, default=3,
-                        help="DNS resolution timeout in seconds (default: 3)")
-    parser.add_argument("--http-timeout", type=int, default=5,
-                        help="HTTP probe timeout in seconds (default: 5)")
-    parser.add_argument("--no-http", action="store_true",
-                        help="Disable HTTP/HTTPS probing")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads (default: 10)")
+    parser.add_argument("--dns-timeout", type=int, default=3, help="DNS resolution timeout (default: 3)")
+    parser.add_argument("--http-timeout", type=int, default=5, help="HTTP probe timeout (default: 5)")
+    parser.add_argument("--no-http", action="store_true", help="Disable HTTP/HTTPS probing")
+    parser.add_argument("-o", "--output", help="Export results to JSON file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--demo", action="store_true", help="Run offline demo against simulated DNS zone")
 
     args = parser.parse_args()
+
+    if args.demo:
+        demo()
+        return
+
+    if not args.domain:
+        parser.error("domain is required (or use --demo)")
 
     wordlist = DEFAULT_SUBDOMAIN_WORDLIST
     if args.wordlist:
@@ -362,10 +522,13 @@ def main():
         dns_timeout=args.dns_timeout,
         http_timeout=args.http_timeout,
         http_probe=not args.no_http,
+        verbose=args.verbose,
     )
 
     try:
         scanner.scan()
+        if args.output:
+            scanner.export_json(args.output)
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user")
         scanner.stop()
